@@ -1,121 +1,129 @@
 import numpy as np
+from scipy.spatial.distance import cdist
 import cv2
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
-background = None
-hand = None
+from synth import Synth
 
-frames_elapsed = 0
-FRAME_SIZE = (500, 500)
+synth = Synth()
 
-CALIBRATION_TIME = 30
-BG_WEIGHT = 0.5
-OBJ_THRESHOLD = 18
+model_path = 'hand_landmarker.task'
 
-capture = cv2.VideoCapture(0)
+FRAME_SIZE = (500,500)
+
+BaseOptions = mp.tasks.BaseOptions
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+HandLandmarkerResult = mp.tasks.vision.HandLandmarkerResult
+VisionRunningMode = mp.tasks.vision.RunningMode
+
+def print_result(result: HandLandmarkerResult, output_image: mp.Image, timestamp_ms: int):
+    #print('hand landmarker result: {}'.format(result))
+    pass
+
+options = HandLandmarkerOptions(
+    base_options=BaseOptions(model_asset_path=model_path),
+    running_mode=VisionRunningMode.VIDEO,
+    num_hands = 2
+)
+
+detector = vision.HandLandmarker.create_from_options(options)
+
+videoFeed = cv2.VideoCapture(0)
+frame_timestamp = 0
+
+hand_locations = {
+    'wrist': 0,
+    'thumb_cmc': 1,
+    'thumb_mcp': 2,
+    'thumb_ip': 3,
+    'thumb_tip': 4,
+    'index_finger_mcp': 5,
+    'index_finger_pip': 6,
+    'index_finger_dip': 7,
+    'index_finger_tip': 8,
+    'middle_finger_mcp': 9,
+    'middle_finger_pip': 10,
+    'middle_finger_dip': 11,
+    'middle_finger_tip': 12,
+    'ring_finger_mcp': 13,
+    'ring_finger_pip': 14,
+    'ring_finger_dip': 15,
+    'ring_finger_tip': 16,
+    'pinky_mcp': 17,
+    'pinky_pip': 18,
+    'pinky_dip': 19,
+    'pinky_tip': 20
+}
 
 class Hand:
-    top = (0, 0)
-    bottom = (0, 0)
-    left = (0, 0)
-    right = (0, 0)
-    centerX = 0
-    prevCenterX = 0
-    isInFrame = False
-    isWaving = False
-    nFingers = 0
-    
-    def __init__(self, top, bottom, left, right, centerX):
-        self.top = top
-        self.bottom = bottom
-        self.left = left
-        self.right = right
-        self.centerX = centerX
-        self.prevCenterX = 0
-        isInFrame = False # do i need tihs?
-        isWaving = False
+    def __init__(self, hand_landmarks):
+        self.hand_landmarks = hand_landmarks
+        self.isInFrame = True
+        self.update(self.hand_landmarks)
         
-    def update(self, top, bottom, left, right):
-        self.top = top
-        self.bottom = bottom
-        self.left = left
-        self.right = right
-
-def write_on_image(frame, hand):
-    text = "Searching..."
+    def update(self, hand_landmarks):
+        self.hand_landmarks = hand_landmarks
+        self.points = np.array([[l.x, l.y, l.z] for l in hand_landmarks]).reshape(-1, 3)
+        self.distance_matrix = cdist(self.points, self.points, metric = 'euclidean')
     
-    if frames_elapsed < CALIBRATION_TIME:
-        text = "Calibrating..."
-    elif hand == None or hand.isInFrame == False:
-        text = "No hand??"
-    else:
-        if hand.isWaving:
-            text = "Waving"
-        else:
-            text = str(hand.nFingers)
+    def getDistance(self, landmark_1, landmark_2):
+        global hand_locations
+        return self.distance_matrix[hand_locations[landmark_1], hand_locations[landmark_2]] 
+    
+    def getSurfaceArea(self):
+        if self.points is None or len(self.points) == 0:
+            return 0.0
+        
+        npPoints = self.points[:, :2].astype(np.float32) #cast to np float 32 so openCV is happy and remove z coordinates
+        hull = cv2.convexHull(npPoints)
+        self.hand_area = cv2.contourArea(hull)
+        return self.hand_area
+        
+    def getSpikiness(self):
+        self.finger_distances = [
+            self.getDistance('thumb_tip', 'index_finger_tip'),
+            self.getDistance('index_finger_tip', 'middle_finger_tip'),
+            self.getDistance('middle_finger_tip', 'ring_finger_tip'),
+            self.getDistance('ring_finger_tip', 'pinky_tip')        
+        ]
+        return sum(self.finger_distances)/len(self.finger_distances) #return average of distances
+        
+    def getValues(self):
+        return (self.getSurfaceArea(), self.getSpikiness())
+           
+while videoFeed.isOpened():
+    success, frame = videoFeed.read()
+    
+    frame = cv2.flip(frame, 1) #mirror and change color 
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data = rgb_frame)
+    
+    frame_timestamp += 33
+    result = detector.detect_for_video(mp_image, frame_timestamp)
+    
+    if result.hand_landmarks:
+        for hand_index, hand_landmarks in enumerate(result.hand_landmarks):
+            for landmark in hand_landmarks: #draw on hand landmarks
+                h, w, _ = frame.shape
+                x, y = int(landmark.x * w), int (landmark.y * h)
+                cv2.circle(frame, (x,y), 5, (0, 255, 0), -1)
+            hand = Hand(hand_landmarks)
             
-    cv2.putText(frame, text, (10,20), cv2.FONT_HERSHEY_COMPLEX, 0.4,( 0 , 0 , 0 ),2,cv2.LINE_AA)
-    cv2.putText(frame, text, (10,20), cv2.FONT_HERSHEY_COMPLEX, 0.4,(255,255,255),1,cv2.LINE_AA)
-    cv2.rectangle(frame, (region_left, region_top), (region_right, region_bottom), (255,255,255), 2)
+            vals = hand.getValues()
+            fx1 = np.interp(float(vals[0]), [0.03, 0.4], [0,1])
+            fx2 = np.interp(float(vals[1]), [0.03, 0.3], [0,1])
+            synth.update(fx1, fx2)
+            print(fx1, fx2)
+              
+                
+    cv2.imshow('Hand track', frame)
     
-def get_region(frame):
-    region = frame[region_top:region_bottom, region_left:region_right]
-    region = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-    region = cv2.GaussianBlur(region, (5,5), 0)
-    return region
-
-def get_average(region):
-    global background
-    if background is None:
-        background = region.copy().astype("float")
-        return
-    else:
-        cv2.accumulateWeighted(region, background, BG_WEIGHT)
-
-def segment(region):
-    global Hand
-    diff = cv2.absdiff(background.astype(np.uint8), region)
-    
-    thresholded_region = cv2.threshold(diff, OBJ_THRESHOLD, 255, cv2.THRESH_BINARY)[1]
-    (contours, _) = cv2.findContours(thresholded_region.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if len(contours) == 0:
-        if Hand is not None:
-            Hand.isInFrame = False
-        return
-    else:
-        if Hand is not None:
-            Hand.isInFrame = True
-        segmented_region = max(contours, key = cv2.contourArea)     
-        return (thresholded_region, segmented_region)
-    
-    
-while True:
-    region_top = 0
-    region_bottom = int(2 * FRAME_SIZE[1] / 3)
-    region_left = int(FRAME_SIZE[1] / 2)
-    region_right = FRAME_SIZE[0]
-    
-    ret, frame = capture.read()
-    frame = cv2.resize(frame, FRAME_SIZE)
-    frame = cv2.flip(frame, 1)
-    region = get_region(frame) #apply greyscale and gaussian blur
-    
-    if frames_elapsed < 30:
-        get_average(region)
-    else:
-        region_pair = segment(region)
-        if region_pair is not None:
-            (thresholded_region, segmented_region) = region_pair
-            blank_region = np.zeros_like(region)
-            cv2.drawContours(blank_region, [segmented_region], -1, (255, 255, 255), thickness = cv2.FILLED)
-            cv2.imshow("Segmented Image", blank_region)
-        
-    write_on_image(frame, hand)
-    cv2.imshow("Camera", frame)
-    frames_elapsed += 1
-    if (cv2.waitKey(1) & 0xFF == ord('x')):
+    if cv2.waitKey(1) & 0xFF == ord('x'):
         break
-    
-capture.release()
-cv2.destroyAllWindows()
 
+videoFeed.release()
+cv2.destroyAllWindows()
+            
